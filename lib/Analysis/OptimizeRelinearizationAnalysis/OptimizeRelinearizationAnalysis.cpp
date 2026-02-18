@@ -11,11 +11,12 @@
 #include "lib/Dialect/Mgmt/IR/MgmtOps.h"
 #include "lib/Dialect/Secret/IR/SecretOps.h"
 #include "lib/Dialect/TensorExt/IR/TensorExtOps.h"
-#include "llvm/include/llvm/ADT/DenseMap.h"            // from @llvm-project
-#include "llvm/include/llvm/ADT/TypeSwitch.h"          // from @llvm-project
-#include "llvm/include/llvm/Support/Casting.h"         // from @llvm-project
-#include "llvm/include/llvm/Support/Debug.h"           // from @llvm-project
-#include "llvm/include/llvm/Support/raw_ostream.h"     // from @llvm-project
+#include "llvm/include/llvm/ADT/DenseMap.h"         // from @llvm-project
+#include "llvm/include/llvm/ADT/TypeSwitch.h"       // from @llvm-project
+#include "llvm/include/llvm/Support/Casting.h"      // from @llvm-project
+#include "llvm/include/llvm/Support/Debug.h"        // from @llvm-project
+#include "llvm/include/llvm/Support/raw_ostream.h"  // from @llvm-project
+#include "mlir/include/mlir/Dialect/Affine/IR/AffineOps.h"  // from @llvm-project
 #include "mlir/include/mlir/Dialect/Arith/IR/Arith.h"  // from @llvm-project
 #include "mlir/include/mlir/IR/BuiltinOps.h"           // from @llvm-project
 #include "mlir/include/mlir/IR/Operation.h"            // from @llvm-project
@@ -53,6 +54,10 @@ namespace mlir {
 namespace heir {
 
 #define DEBUG_TYPE "optimize-relinearization-analysis"
+
+// Returns true if the given operation is a loop-like op whose body should be
+// processed separately.
+static bool isLoopLikeOp(Operation* op) { return isa<affine::AffineForOp>(op); }
 
 LogicalResult OptimizeRelinearizationAnalysis::solve() {
   math_opt::Model model("OptimizeRelinearizationAnalysis");
@@ -94,28 +99,38 @@ LogicalResult OptimizeRelinearizationAnalysis::solve() {
   // track it.
   llvm::DenseMap<Value, math_opt::Variable> beforeRelinVars;
 
-  // First create a variable for each SSA value tracking the key basis degree
-  // of the ciphertext at that point in the computation, as well as the decision
-  // variable to track whether to insert a relinearization operation after the
-  // operation.
-  opToRunOn->walk([&](Operation* op) {
-    std::string name = uniqueName(op);
+  // Create keyBasisVars for this block's own arguments.
+  for (BlockArgument arg : blockToRunOn->getArguments()) {
+    if (!isSecret(arg, solver)) {
+      continue;
+    }
+    std::stringstream ss;
+    ss << "Degree_ba" << arg.getArgNumber();
+    std::string varName = ss.str();
+    auto keyBasisVar =
+        model.AddContinuousVariable(0, MAX_KEY_BASIS_DEGREE, varName);
+    keyBasisVars.insert(std::make_pair(arg, keyBasisVar));
+  }
+
+  // Create variables for operations directly in this block (not recursively).
+  for (Operation& op : *blockToRunOn) {
+    std::string name = uniqueName(&op);
 
     if (isa<ModuleOp>(op)) {
-      return;
+      continue;
     }
 
-    // skip secret generic op; we decide inside generic op block
-    if (!isa<secret::GenericOp>(op) && isSecret(op->getResults(), solver)) {
+    // Skip secret.generic ops; we decide inside the generic op's block.
+    // For loop-like ops, we still create variables for their results
+    // (which are visible in this block), but don't recurse into their bodies.
+    if (!isa<secret::GenericOp>(op) && isSecret(op.getResults(), solver)) {
       auto decisionVar = model.AddBinaryVariable("InsertRelin_" + name);
-      decisionVariables.insert(std::make_pair(op, decisionVar));
+      decisionVariables.insert(std::make_pair(&op, decisionVar));
     }
 
-    // Except for block arguments, SSA values are created as results of
-    // operations. Create one keyBasisDegree variable for each op result.
+    // Create one keyBasisDegree variable for each op result.
     std::string varName = "Degree_" + name;
-    for (OpResult opResult : op->getOpResults()) {
-      // skip secret generic ops
+    for (OpResult opResult : op.getOpResults()) {
       Value result = opResult;
       varName = varName + "_" + std::to_string(opResult.getResultNumber());
 
@@ -134,40 +149,30 @@ LogicalResult OptimizeRelinearizationAnalysis::solve() {
       beforeRelinVars.insert(std::make_pair(result, brKeyBasisVar));
     }
 
-    // Handle block arguments to the op, which are assumed to already be
-    // linearized, though this could be generalized to read the degree from the
-    // type.
-    if (op->getNumRegions() == 0) {
-      return;
-    }
+    // We do NOT create variables for inner block arguments of ops with
+    // regions (loop bodies, etc.). Those are handled when we recursively
+    // process the inner block in a separate analysis instance.
+  }
 
-    LLVM_DEBUG(llvm::dbgs()
-               << "Handling block arguments for " << op->getName() << "\n");
-    for (Region& region : op->getRegions()) {
-      for (Block& block : region.getBlocks()) {
-        for (BlockArgument arg : block.getArguments()) {
-          if (!isSecret(arg, solver)) {
-            continue;
-          }
+  // Constraints to initialize the key basis degree variables for block
+  // arguments. For loop body blocks, we conservatively constrain iter_arg
+  // block arguments to degree 1. For secret.generic body blocks, we use
+  // the DimensionAnalysis result.
+  Operation* parentOp = blockToRunOn->getParentOp();
+  bool isLoopBody = parentOp && isLoopLikeOp(parentOp);
 
-          std::stringstream ss;
-          ss << "Degree_ba" << arg.getArgNumber() << "_" << name;
-          std::string varName = ss.str();
-          auto keyBasisVar =
-              model.AddContinuousVariable(0, MAX_KEY_BASIS_DEGREE, varName);
-          keyBasisVars.insert(std::make_pair(arg, keyBasisVar));
-        }
-      }
-    }
-  });
-
-  // Constraints to initialize the key basis degree variables at the start of
-  // the computation.
   for (auto& [value, var] : keyBasisVars) {
     if (llvm::isa<BlockArgument>(value)) {
-      // If the dimension is 3, the key basis is [0, 1, 2] and the degree is 2.
-      auto constrainedDegree = getDimension(value, solver).value_or(2) - 1;
-      model.AddLinearConstraint(var == constrainedDegree, "");
+      if (isLoopBody) {
+        // Loop body block args: conservatively require degree 1.
+        // This ensures a consistent fixed-point across iterations.
+        model.AddLinearConstraint(var == 1, "");
+      } else {
+        // secret.generic body block args: use DimensionAnalysis.
+        // If the dimension is 3, the key basis is [0, 1, 2] and degree is 2.
+        auto constrainedDegree = getDimension(value, solver).value_or(2) - 1;
+        model.AddLinearConstraint(var == constrainedDegree, "");
+      }
     }
   }
 
@@ -179,24 +184,24 @@ LogicalResult OptimizeRelinearizationAnalysis::solve() {
   // through from the input unchanged. If we don't require this, the output
   // of the addition must be a max over the input degrees.
   if (!allowMixedDegreeOperands) {
-    opToRunOn->walk([&](Operation* op) {
-      if (op->getNumOperands() <= 1) {
-        return;
+    for (Operation& op : *blockToRunOn) {
+      if (op.getNumOperands() <= 1) {
+        continue;
       }
 
       // secret generic op arguments are not constrained
       // instead their block arguments are constrained
       if (isa<secret::GenericOp>(op)) {
-        return;
+        continue;
       }
 
-      std::string name = uniqueName(op);
+      std::string name = uniqueName(&op);
 
       // only equality for secret operands
       SmallVector<OpOperand*, 4> secretOperands;
-      getSecretOperands(op, secretOperands, solver);
+      getSecretOperands(&op, secretOperands, solver);
       if (secretOperands.size() <= 1) {
-        return;
+        continue;
       }
 
       auto anchorVar = keyBasisVars.at(secretOperands[0]->get());
@@ -215,37 +220,39 @@ LogicalResult OptimizeRelinearizationAnalysis::solve() {
            << name;
         model.AddLinearConstraint(operandDegreeVar == anchorVar, ss.str());
       }
-    });
+    }
   }
 
   // Some ops require a linear key basis. Yield is a special case
   // where we require returned values from funcs to be linearized.
+  // Loop yields (affine.yield) and loop ops (affine.for) also require
+  // linearized operands to maintain degree 1 at loop boundaries.
   // TODO(#1398): determine whether we need linear key basis for modreduce.
-  opToRunOn->walk([&](Operation* op) {
-    llvm::TypeSwitch<Operation&>(*op)
-        .Case<tensor_ext::RotateOp, secret::YieldOp, mgmt::ModReduceOp>(
-            [&](auto op) {
-              for (OpOperand& operand : op->getOpOperands()) {
-                // skip non secret argument
-                if (!isSecret(operand.get(), solver)) {
-                  continue;
-                }
-                if (!keyBasisVars.contains(operand.get())) {
-                  // This could happen if you return a block argument without
-                  // doing anything to it. No variables are created, but it does
-                  // not necessarily need to be constrained.
-                  if (isa<secret::YieldOp>(op)) return;
+  for (Operation& op : *blockToRunOn) {
+    llvm::TypeSwitch<Operation&>(op)
+        .Case<tensor_ext::RotateOp, secret::YieldOp, mgmt::ModReduceOp,
+              affine::AffineYieldOp, affine::AffineForOp>([&](auto op) {
+          for (OpOperand& operand : op->getOpOperands()) {
+            // skip non secret argument
+            if (!isSecret(operand.get(), solver)) {
+              continue;
+            }
+            if (!keyBasisVars.contains(operand.get())) {
+              // This could happen if you return a block argument without
+              // doing anything to it. No variables are created, but it does
+              // not necessarily need to be constrained.
+              if (isa<secret::YieldOp, affine::AffineYieldOp>(op)) return;
 
-                  assert(false && "Operand not found in keyBasisVars");
-                }
-                auto operandDegreeVar = keyBasisVars.at(operand.get());
-                std::stringstream ss;
-                ss << "RequireLinearized_" << uniqueName(op) << "_"
-                   << operand.getOperandNumber();
-                model.AddLinearConstraint(operandDegreeVar == 1, ss.str());
-              }
-            });
-  });
+              assert(false && "Operand not found in keyBasisVars");
+            }
+            auto operandDegreeVar = keyBasisVars.at(operand.get());
+            std::stringstream ss;
+            ss << "RequireLinearized_" << uniqueName(op) << "_"
+               << operand.getOperandNumber();
+            model.AddLinearConstraint(operandDegreeVar == 1, ss.str());
+          }
+        });
+  }
 
   // When mixed-degree ops are enabled, the default result degree of an op is
   // the max of the operand degree. This next block of code adds inequality
@@ -254,8 +261,8 @@ LogicalResult OptimizeRelinearizationAnalysis::solve() {
   std::unordered_set<const math_opt::Variable*> extraVarsForObjective;
 
   // Add constraints that set the before_relin variables appropriately
-  opToRunOn->walk([&](Operation* op) {
-    llvm::TypeSwitch<Operation&>(*op)
+  for (Operation& op : *blockToRunOn) {
+    llvm::TypeSwitch<Operation&>(op)
         .Case<arith::MulIOp, arith::MulFOp>([&](auto op) {
           // if plain mul, skip
           if (!isSecret(op.getResult(), solver)) {
@@ -360,7 +367,7 @@ LogicalResult OptimizeRelinearizationAnalysis::solve() {
             }
           }
         });
-  });
+  }
 
   // The objective is to minimize the number of relinearization ops.
   // TODO(#1018): improve the objective function to account for differing costs
@@ -373,7 +380,7 @@ LogicalResult OptimizeRelinearizationAnalysis::solve() {
   model.Minimize(obj);
 
   // Add constraints that control the effect of relinearization insertion.
-  opToRunOn->walk([&](Operation* op) {
+  for (Operation& op : *blockToRunOn) {
     // We don't need a type switch here because the only difference
     // between mul and other ops is how the before_relin variable is related to
     // the operand variables.
@@ -386,18 +393,18 @@ LogicalResult OptimizeRelinearizationAnalysis::solve() {
     // secret generic op arguments are not constrained
     // instead their block arguments are constrained
     if (isa<secret::GenericOp>(op)) {
-      return;
+      continue;
     }
-    if (!isSecret(op->getResults(), solver)) {
-      return;
+    if (!isSecret(op.getResults(), solver)) {
+      continue;
     }
 
-    for (OpResult opResult : op->getResults()) {
+    for (OpResult opResult : op.getResults()) {
       Value result = opResult;
       auto resultBeforeRelinVar = beforeRelinVars.at(result);
       auto resultAfterRelinVar = keyBasisVars.at(result);
-      auto insertRelinOpDecision = decisionVariables.at(op);
-      std::string opName = uniqueName(op);
+      auto insertRelinOpDecision = decisionVariables.at(&op);
+      std::string opName = uniqueName(&op);
       std::string ddPrefix = "DecisionDynamics_" + opName + "_" +
                              std::to_string(opResult.getResultNumber());
 
@@ -422,7 +429,7 @@ LogicalResult OptimizeRelinearizationAnalysis::solve() {
               resultBeforeRelinVar + IF_THEN_AUX * insertRelinOpDecision,
           cstName);
     }
-  });
+  }
 
   // Dump the model
   LLVM_DEBUG({

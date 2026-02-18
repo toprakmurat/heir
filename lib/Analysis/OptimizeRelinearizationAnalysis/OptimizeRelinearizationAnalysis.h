@@ -3,6 +3,7 @@
 
 #include "llvm/include/llvm/ADT/DenseMap.h"                // from @llvm-project
 #include "mlir/include/mlir/Analysis/DataFlowFramework.h"  // from @llvm-project
+#include "mlir/include/mlir/IR/Block.h"                    // from @llvm-project
 #include "mlir/include/mlir/IR/Operation.h"                // from @llvm-project
 #include "mlir/include/mlir/IR/Value.h"                    // from @llvm-project
 #include "mlir/include/mlir/Support/LLVM.h"                // from @llvm-project
@@ -11,10 +12,10 @@ namespace mlir {
 namespace heir {
 class OptimizeRelinearizationAnalysis {
  public:
-  OptimizeRelinearizationAnalysis(Operation* op, DataFlowSolver* solver,
+  OptimizeRelinearizationAnalysis(Block* block, DataFlowSolver* solver,
                                   bool useLocBasedVariableNames,
                                   bool allowMixedDegreeOperands)
-      : opToRunOn(op),
+      : blockToRunOn(block),
         solver(solver),
         useLocBasedVariableNames(useLocBasedVariableNames),
         allowMixedDegreeOperands(allowMixedDegreeOperands) {}
@@ -39,7 +40,7 @@ class OptimizeRelinearizationAnalysis {
   }
 
  private:
-  Operation* opToRunOn;
+  Block* blockToRunOn;
   DataFlowSolver* solver;
   bool useLocBasedVariableNames;
   bool allowMixedDegreeOperands;

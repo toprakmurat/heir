@@ -9,6 +9,7 @@
 #include "lib/Dialect/Mgmt/Transforms/AnnotateMgmt.h"
 #include "lib/Dialect/ModuleAttributes.h"
 #include "lib/Dialect/Secret/IR/SecretOps.h"
+#include "llvm/include/llvm/ADT/SmallVector.h"             // from @llvm-project
 #include "llvm/include/llvm/Support/Debug.h"               // from @llvm-project
 #include "mlir/include/mlir/Analysis/DataFlow/Utils.h"     // from @llvm-project
 #include "mlir/include/mlir/Analysis/DataFlowFramework.h"  // from @llvm-project
@@ -32,37 +33,70 @@ struct OptimizeRelinearization
     : impl::OptimizeRelinearizationBase<OptimizeRelinearization> {
   using OptimizeRelinearizationBase::OptimizeRelinearizationBase;
 
-  void processSecretGenericOp(secret::GenericOp genericOp,
-                              DataFlowSolver* solver) {
-    // Remove all relin ops. This makes the IR invalid, because the key basis
-    // sizes are incorrect. However, the correctness of the ILP ensures the key
-    // basis sizes are made correct at the end.
-    genericOp->walk([&](mgmt::RelinearizeOp op) {
-      op.getResult().replaceAllUsesWith(op.getOperand());
-      op.erase();
-    });
-
-    OptimizeRelinearizationAnalysis analysis(
-        genericOp, solver, useLocBasedVariableNames, allowMixedDegreeOperands);
-    if (failed(analysis.solve())) {
-      genericOp->emitError("Failed to solve the optimization problem");
-      return signalPassFailure();
+  // Process a single block: recursively handle inner loop bodies first,
+  // then strip relins, solve ILP, and insert optimal relins for this block.
+  LogicalResult processBlock(Block& block, DataFlowSolver* solver) {
+    // Step 1: Recursively process inner blocks of loop-like ops.
+    // This ensures inner loop bodies are solved before the outer block.
+    for (Operation& op : block) {
+      if (op.getNumRegions() > 0 && !isa<secret::GenericOp>(&op)) {
+        for (Region& region : op.getRegions()) {
+          for (Block& innerBlock : region.getBlocks()) {
+            if (failed(processBlock(innerBlock, solver))) {
+              return failure();
+            }
+          }
+        }
+      }
     }
 
+    // Step 2: Strip relins in THIS block only (not walking into nested
+    // regions). Inner blocks have already been processed and have their
+    // own optimal relins in place.
+    for (Operation& op : llvm::make_early_inc_range(block)) {
+      if (auto relinOp = dyn_cast<mgmt::RelinearizeOp>(&op)) {
+        relinOp.getResult().replaceAllUsesWith(relinOp.getOperand());
+        relinOp.erase();
+      }
+    }
+
+    // Step 3: Solve the ILP for THIS block only.
+    OptimizeRelinearizationAnalysis analysis(
+        &block, solver, useLocBasedVariableNames, allowMixedDegreeOperands);
+    if (failed(analysis.solve())) {
+      block.getParentOp()->emitError(
+          "Failed to solve the relinearization optimization problem");
+      return failure();
+    }
+
+    // Step 4: Collect ops that need relins inserted after them.
     OpBuilder b(&getContext());
+    SmallVector<Operation*> opsToRelin;
+    for (Operation& op : block) {
+      if (analysis.shouldInsertRelin(&op)) {
+        opsToRelin.push_back(&op);
+      }
+    }
 
-    genericOp->walk([&](Operation* op) {
-      if (!analysis.shouldInsertRelin(op)) return;
-
+    // Step 5: Insert relins at the optimal locations.
+    for (Operation* op : opsToRelin) {
       LLVM_DEBUG(llvm::dbgs()
                  << "Inserting relin after: " << op->getName() << "\n");
-
       b.setInsertionPointAfter(op);
       for (Value result : op->getResults()) {
         auto reduceOp = mgmt::RelinearizeOp::create(b, op->getLoc(), result);
         result.replaceAllUsesExcept(reduceOp.getResult(), {reduceOp});
       }
-    });
+    }
+
+    return success();
+  }
+
+  void processSecretGenericOp(secret::GenericOp genericOp,
+                              DataFlowSolver* solver) {
+    if (failed(processBlock(*genericOp.getBody(), solver))) {
+      return signalPassFailure();
+    }
   }
 
   void runOnOperation() override {

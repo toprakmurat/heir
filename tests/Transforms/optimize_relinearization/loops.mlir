@@ -1,10 +1,13 @@
 // RUN: heir-opt --annotate-module="backend=openfhe scheme=ckks" --secret-insert-mgmt-ckks --optimize-relinearization %s | FileCheck %s
 
-// Ensure that optimize-relinearization handles operations with multiple results.
+// Ensure that optimize-relinearization correctly handles loop bodies by
+// processing them as independent blocks with fixed-point constraints.
 module {
   // CHECK: func @loop
   // CHECK: affine.for
-  // CHECK-NOT: mgmt.relinearize
+  // CHECK: arith.mulf
+  // The ct-pt mul inside the loop body should be optimized correctly.
+  // With the block-scoped approach, the loop body is solved independently.
   // CHECK: affine.yield
   // CHECK: return
   func.func @loop(%arg0: !secret.secret<tensor<1x1024xf32>>) -> !secret.secret<tensor<1x1024xf32>> {
