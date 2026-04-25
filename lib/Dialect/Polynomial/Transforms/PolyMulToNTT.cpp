@@ -524,11 +524,10 @@ void PolyMulToNTT::runOnOperation() {
         coeffFormCache[v] = v;
       }
       if (soln.needsForm(v, Form::EVAL)) {
-        // Change the output type of the current op (if we don't need it in
-        // coeff form), otherwise clone the existing op
-        Operation* evalOp = needCoeff ? b.clone(*op) : op;
-        evalOp->getResult(0).setType(typeToForm(v.getType(), Form::EVAL));
-        evalFormCache[v] = evalOp->getResult(0);
+        // Constants are always constructed in COEFF form.
+        // If we need an EVAL form, we explicitly emit an NTT conversion.
+        Value coeffVal = needCoeff ? b.clone(*op)->getResult(0) : v;
+        evalFormCache[v] = addConversion(coeffVal, Form::EVAL);
       }
     } else {
       op->emitOpError(

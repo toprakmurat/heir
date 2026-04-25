@@ -276,6 +276,13 @@ struct ConvertConstant : public OpConversionPattern<ConstantOp> {
 
     auto typeInfo = res.value();
 
+    if (typeInfo.polynomialType.getForm() == Form::EVAL) {
+      return rewriter.notifyMatchFailure(
+          op,
+          "ConstantOp in eval form is not supported; "
+          "the PolyMulToNTT pass should emit NTT conversions");
+    }
+
     auto attr = dyn_cast<TypedIntPolynomialAttr>(op.getValue());
     if (!attr)
       return rewriter.notifyMatchFailure(op,
@@ -361,6 +368,13 @@ struct ConvertMonomial : public OpConversionPattern<MonomialOp> {
       return rewriter.notifyMatchFailure(
           op, "failed to construct common conversion info");
     auto typeInfo = res.value();
+
+    if (typeInfo.polynomialType.getForm() == Form::EVAL) {
+      return rewriter.notifyMatchFailure(
+          op,
+          "MonomialOp in eval form is not supported; "
+          "the PolyMulToNTT pass should emit NTT conversions");
+    }
 
     SmallVector<int64_t> storageShape(typeInfo.tensorType.getShape().begin(),
                                       typeInfo.tensorType.getShape().end());
